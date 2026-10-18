@@ -1,0 +1,71 @@
+import pandas as pd
+import numpy as np
+
+def calculate_daily_metrics(users_df, userentry_df, orders_df, start_date_str, end_date_str):
+    """
+    рассчитывает ежедневные продуктовые метрики (DAU, Buyers, Revenue, Conversion) 
+    для отслеживания активности и монетизации платформы.
+    В расчет берутся только успешные транзакции и активность валидных 
+    пользователей для исключения фродового трафика.
+    """
+    start_date = pd.to_datetime(start_date_str)
+    end_date = pd.to_datetime(end_date_str)
+    
+    # исключаем заблокированных пользователей (ботов/фрод), чтобы они не завышали DAU
+    active_users = userentry_df.merge(users_df, left_on='user_id', right_on='id', how='inner')
+    active_users = active_users[
+        (active_users['is_blocked'] != True) & 
+        (active_users['entry_at'] >= start_date) & 
+        (active_users['entry_at'] < end_date)
+    ].copy()
+    active_users['activity_date'] = active_users['entry_at'].dt.date
+    daily_activity = active_users.groupby('activity_date')['user_id'].nunique().reset_index(name='daily_active_users_cnt')
+    
+    # оставляем только фактически оплаченные заказы, отбрасывая отмененные или в обработке
+    valid_orders = orders_df[
+        (orders_df['paid_at'].notnull()) & 
+        (orders_df['status'].isin(['paid', 'completed'])) &
+        (orders_df['paid_at'] >= start_date) & 
+        (orders_df['paid_at'] < end_date)
+    ].copy()
+     valid_orders['payment_date'] = valid_orders['paid_at'].dt.date
+    daily_sales = valid_orders.groupby('payment_date').agg(
+        daily_buyers_cnt=('user_id', 'nunique'),
+        daily_revenue=('amount', 'sum')
+    ).reset_index()
+    
+    # генерируем непрерывный календарь, чтобы дни без активности пользователей 
+    # не выпадали из итогового отчета, а корректно отображались с нулями
+    calendar_end = end_date - pd.Timedelta(days=1)
+    calendar = pd.DataFrame({
+        'date_from_calendar': pd.date_range(start=start_date, end=calendar_end).date
+    })
+    
+    metrics = calendar.merge(daily_activity, left_on='date_from_calendar', right_on='activity_date', how='left')
+    metrics = metrics.merge(daily_sales, left_on='date_from_calendar', right_on='payment_date', how='left')
+    
+    # заполняем пропуски нулями для корректной работы математических операций ниже
+    metrics['daily_active_users_cnt'] = metrics['daily_active_users_cnt'].fillna(0)
+    metrics['daily_buyers_cnt'] = metrics['daily_buyers_cnt'].fillna(0)
+    metrics['daily_revenue'] = metrics['daily_revenue'].fillna(0)
+    metrics = metrics.sort_values('date_from_calendar')
+    metrics['previous_day_dau_cnt'] = metrics['daily_active_users_cnt'].shift(1)
+    metrics['max_dau_cnt'] = metrics['daily_active_users_cnt'].max()
+    metrics['dau_difference'] = metrics['daily_active_users_cnt'] - metrics['previous_day_dau_cnt']
+    metrics['diff_from_max_dau'] = metrics['daily_active_users_cnt'] - metrics['max_dau_cnt']
+    
+    # используем np.where для безопасного расчета конверсии: 
+    # предотвращаем ошибку деления на ноль  в дни, когда DAU = 0
+    metrics['buyer_conversion_pct'] = np.where(
+        metrics['daily_active_users_cnt'] == 0, 
+        0, 
+        np.round((metrics['daily_buyers_cnt'] / metrics['daily_active_users_cnt']) * 100, 2)
+    )
+    
+    final_df = metrics[[
+        'date_from_calendar', 'daily_active_users_cnt', 'daily_buyers_cnt', 
+        'daily_revenue', 'previous_day_dau_cnt', 'dau_difference', 
+        'max_dau_cnt', 'diff_from_max_dau', 'buyer_conversion_pct'
+    ]]
+    
+    return final_df
